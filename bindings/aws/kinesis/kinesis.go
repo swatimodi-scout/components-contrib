@@ -50,21 +50,24 @@ type AWSKinesis struct {
 	logger       logger.Logger
 	consumerMode string
 
-	closed  atomic.Bool
-	closeCh chan struct{}
-	wg      sync.WaitGroup
+	closed          atomic.Bool
+	closeCh         chan struct{}
+	wg              sync.WaitGroup
+	applicationName string
 }
 
 // TODO: we need to clean up the metadata fields here and update this binding to use the builtin aws auth provider and reflect in metadata.yaml
 type kinesisMetadata struct {
-	StreamName          string `json:"streamName" mapstructure:"streamName"`
-	ConsumerName        string `json:"consumerName" mapstructure:"consumerName"`
-	Region              string `json:"region" mapstructure:"region"`
-	Endpoint            string `json:"endpoint" mapstructure:"endpoint"`
-	AccessKey           string `json:"accessKey" mapstructure:"accessKey"`
-	SecretKey           string `json:"secretKey" mapstructure:"secretKey"`
-	SessionToken        string `json:"sessionToken" mapstructure:"sessionToken"`
-	KinesisConsumerMode string `json:"mode" mapstructure:"mode"`
+	StreamName            string `json:"streamName" mapstructure:"streamName"`
+	ConsumerName          string `json:"consumerName" mapstructure:"consumerName"`
+	Region                string `json:"region" mapstructure:"region"`
+	Endpoint              string `json:"endpoint" mapstructure:"endpoint"`
+	AccessKey             string `json:"accessKey" mapstructure:"accessKey"`
+	SecretKey             string `json:"secretKey" mapstructure:"secretKey"`
+	SessionToken          string `json:"sessionToken" mapstructure:"sessionToken"`
+	KinesisConsumerMode   string `json:"mode" mapstructure:"mode"`
+	ApplicationName       string `json:"applicationName" mapstructure:"applicationName"`
+	DeadLetterBindingName string `json:"deadLetterBindingName" mapstructure:"deadLetterBindingName"`
 }
 
 const (
@@ -98,6 +101,16 @@ func NewAWSKinesis(logger logger.Logger) bindings.InputOutputBinding {
 	}
 }
 
+// GetDeadLetterBinding implements the bindings.DLQInputBinding interface.
+func (a *AWSKinesis) GetDeadLetterBinding() bindings.DLQMetadata {
+	return bindings.DLQMetadata{
+		Name: a.metadata.DeadLetterBindingName, // Name: The name of the output binding component (defined via Dapr Component YAML)
+		Metadata: map[string]string{ // Metadata: Optional context to be included in the DLQ InvokeRequest.
+			"dapr.dlq.source.binding.name": "bindings.aws.kinesis", // Standard metadata field to identify the type of component that generated the event.
+		},
+	}
+}
+
 // Init does metadata parsing and connection creation.
 func (a *AWSKinesis) Init(ctx context.Context, metadata bindings.Metadata) error {
 	m, err := a.parseMetadata(metadata)
@@ -115,6 +128,7 @@ func (a *AWSKinesis) Init(ctx context.Context, metadata bindings.Metadata) error
 
 	a.consumerMode = m.KinesisConsumerMode
 	a.streamName = m.StreamName
+	a.applicationName = m.ApplicationName
 	a.consumerName = m.ConsumerName
 	a.metadata = m
 
@@ -182,9 +196,16 @@ func (a *AWSKinesis) Read(ctx context.Context, handler bindings.Handler) (err er
 		}
 	}
 
-	stream, err := a.authProvider.Kinesis().Stream(ctx, a.streamName)
-	if err != nil {
-		return fmt.Errorf("failed to get kinesis stream arn: %v", err)
+	var stream *string
+	/**
+	 * Invoke this only when KinesisConsumerMode is set to 'extended' to avoid unnecessary calls.
+	 */
+	if a.metadata.KinesisConsumerMode == ExtendedFanout {
+		streamARN, err := a.authProvider.Kinesis().Stream(ctx, a.streamName)
+		if err != nil {
+			return fmt.Errorf("failed to get kinesis stream arn: %v", err)
+		}
+		stream = streamARN
 	}
 	// Wait for context cancelation then stop
 	a.wg.Add(1)
@@ -398,9 +419,21 @@ func (p *recordProcessor) ProcessRecords(input *interfaces.ProcessRecordsInput) 
 	}
 
 	for _, v := range input.Records {
-		p.handler(p.ctx, &bindings.ReadResponse{
+		// Invoke the Dapr Application Handler.
+		// The error returned here is what triggers the Dapr Runtime's Resiliency Policy.
+		_, err := p.handler(p.ctx, &bindings.ReadResponse{
 			Data: v.Data,
 		})
+
+		if err != nil {
+			// A failure in the Dapr handler occurred (e.g., app connection failed or returned an error).
+			// We log the error and **MUST** return immediately without checkpointing the batch.
+			// Returning ensures the KCL (Kinesis Client Library) will not mark this shard's
+			// sequence number as processed, which forces KCL to re-read and re-process
+			// the entire batch after a short delay, allowing Dapr's retry policy to restart.
+			p.logger.Errorf("Record processing failed: %v. Relying on Dapr Resiliency/DLQ logic. Checkpoint prevented for this batch.", err)
+			return // Prevents checkpointing the current batch.
+		}
 	}
 
 	// checkpoint it after processing this batch
