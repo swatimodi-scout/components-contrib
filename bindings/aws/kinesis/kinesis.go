@@ -26,34 +26,32 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/google/uuid"
-	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/interfaces"
-	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/worker"
-
 	"github.com/dapr/components-contrib/bindings"
+	sqsBinding "github.com/dapr/components-contrib/bindings/aws/sqs"
 	awsAuth "github.com/dapr/components-contrib/common/authentication/aws"
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 	kitmd "github.com/dapr/kit/metadata"
+	"github.com/google/uuid"
+	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/interfaces"
+	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/worker"
 )
 
 // AWSKinesis allows receiving and sending data to/from AWS Kinesis stream.
 type AWSKinesis struct {
-	authProvider awsAuth.Provider
-	metadata     *kinesisMetadata
-
-	worker *worker.Worker
-
-	streamName   string
-	consumerName string
-	consumerARN  *string
-	logger       logger.Logger
-	consumerMode string
-
+	authProvider    awsAuth.Provider
+	metadata        *kinesisMetadata
+	worker          *worker.Worker
+	streamName      string
+	consumerName    string
+	consumerARN     *string
+	logger          logger.Logger
+	consumerMode    string
 	closed          atomic.Bool
 	closeCh         chan struct{}
 	wg              sync.WaitGroup
 	applicationName string
+	sqsFallback     *sqsBinding.AWSSQS
 }
 
 // TODO: we need to clean up the metadata fields here and update this binding to use the builtin aws auth provider and reflect in metadata.yaml
@@ -67,6 +65,7 @@ type kinesisMetadata struct {
 	SessionToken        string `json:"sessionToken" mapstructure:"sessionToken"`
 	KinesisConsumerMode string `json:"mode" mapstructure:"mode"`
 	ApplicationName     string `json:"applicationName" mapstructure:"applicationName"`
+	FallbackSQSQueue    string `json:"fallbackSqsQueue" mapstructure:"fallbackSqsQueue"`
 }
 
 const (
@@ -135,6 +134,23 @@ func (a *AWSKinesis) Init(ctx context.Context, metadata bindings.Metadata) error
 		return err
 	}
 	a.authProvider = provider
+
+	if m.FallbackSQSQueue != "" {
+		a.sqsFallback = sqsBinding.NewAWSSQS(a.logger).(*sqsBinding.AWSSQS)
+		sqsMetadata := bindings.Metadata{}
+		sqsMetadata.Properties = map[string]string{
+			"queueName":    m.FallbackSQSQueue,
+			"region":       m.Region,
+			"endpoint":     m.Endpoint,
+			"accessKey":    m.AccessKey,
+			"secretKey":    m.SecretKey,
+			"sessionToken": m.SessionToken,
+		}
+		err = a.sqsFallback.Init(ctx, sqsMetadata)
+		if err != nil {
+			return fmt.Errorf("failed to initialize SQS fallback: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -159,6 +175,11 @@ func (a *AWSKinesis) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*
 func (a *AWSKinesis) Read(ctx context.Context, handler bindings.Handler) (err error) {
 	if a.closed.Load() {
 		return errors.New("binding is closed")
+	}
+	// Load kinesis with fallback SQS DLQ
+	if a.metadata.FallbackSQSQueue != "" {
+		handler = a.wrapHandlerWithFallback(handler)
+		a.logger.Infof("Using SQS fallback for stream %s", a.streamName)
 	}
 
 	switch a.metadata.KinesisConsumerMode {
@@ -290,6 +311,9 @@ func (a *AWSKinesis) Close() error {
 	a.wg.Wait()
 	if a.authProvider != nil {
 		return a.authProvider.Close()
+	}
+	if a.sqsFallback != nil {
+		a.sqsFallback.Close()
 	}
 	return nil
 }
@@ -433,4 +457,36 @@ func (a *AWSKinesis) GetComponentMetadata() (metadataInfo metadata.MetadataMap) 
 	metadataStruct := &kinesisMetadata{}
 	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, metadata.BindingType)
 	return
+}
+
+func (a *AWSKinesis) wrapHandlerWithFallback(handler bindings.Handler) bindings.Handler {
+	return func(ctx context.Context, resp *bindings.ReadResponse) ([]byte, error) {
+		result, err := handler(ctx, resp)
+		if err != nil && a.sqsFallback != nil {
+			// temp we send source consumer name or streamName
+			source := a.consumerName
+			if source == "" {
+				source = a.streamName
+			}
+			a.sendToSQSFallback(ctx, err, source, resp.Data)
+		}
+		return result, err
+	}
+}
+
+func (a *AWSKinesis) sendToSQSFallback(ctx context.Context, errorReason error, source string, data []byte) error {
+	_, err := a.sqsFallback.Invoke(ctx, &bindings.InvokeRequest{
+		Data:      data,
+		Operation: bindings.CreateOperation,
+		Metadata: map[string]string{
+			"reason": errorReason.Error(),
+			"source": source,
+		},
+	})
+	if err != nil {
+		a.logger.Errorf("Failed to send to SQS : %v", err)
+		return err
+	}
+	a.logger.Infof("Successfully sent to SQS")
+	return nil
 }
